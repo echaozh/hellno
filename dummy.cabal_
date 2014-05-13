@@ -1,0 +1,9 @@
+name: dummy
+version: 0.1.0.0
+cabal-version: >=1.10
+build-type: Simple
+
+executable dummy
+  main-is: dummy.hs
+  build-depends: base >= 4.5
+  default-language: Haskell98

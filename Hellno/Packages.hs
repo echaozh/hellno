@@ -10,12 +10,19 @@ import qualified Distribution.InstalledPackageInfo as IPI
 import System.Directory
 import System.FilePath
 import System.Posix.Files
+import Data.Monoid
 import Data.List (intercalate, isPrefixOf)
 import Data.Functor.Identity (Identity)
+import Data.Function
+import Data.Composition
 import Text.Parsec
 import Control.Applicative ((<*), (<$>), (<*>))
 import Control.Monad
 import Control.Exception (throw, throwIO)
+import Control.Applicative hiding (many)
+import Distribution.Simple.LocalBuildInfo
+import Distribution.Simple.InstallDirs
+import Distribution.Simple.Compiler
 
 import Hellno
 
@@ -81,47 +88,67 @@ getHashName pid = do
  The second argument is the names of executables provided by the package.
  The package must have a library.
 -}
-grabPackage :: PackageIdentifier -> [String] -> IO InstalledPackageId
-grabPackage pid execs = do
+grabPackage :: LocalBuildInfo -> PackageIdentifier -> [String]
+            -> IO InstalledPackageId
+grabPackage lbi pid execs = do
     let (name, fullname) = packageIdToString pid
+    putStrLn $ "grabbing package " ++ fullname
     hashname <- getHashName pid
     let path = pkgRoot </> name </> fullname </> hashname
-    let moveStuff a = do
-            e <- doesDirectoryExist $ instPrefix </> a </> fullname
-            when e $ moveRecursive (instPrefix </> a </> fullname)
-                (path </> a </> fullname)
-    moveStuff "lib"
-    moveStuff "share"
-    moveStuff $ "share" </> "doc"
+    let moveStuff f = processStuffInDir moveRecursive True f pid lbi path ""
+    moveStuff $ liftA2 (<>) libdir libsubdir
+    moveStuff $ liftA2 (<>) datadir datasubdir
+    moveStuff docdir
     moveRecursive (ghcPkg </> hashname <.> "conf") (path <.> "conf")
     unless (null execs) $ createDirectoryIfMissing True $ path </> "bin"
-    forM_ execs $ \a' -> do
-        let a = "bin" </> a'
-        e <- doesFileExist $ instPrefix </> a
-        when e $ moveRecursive (instPrefix </> a) (path </> a)
+    forM_ execs $ processStuffInDir moveRecursive True bindir pid lbi path
     return $ InstalledPackageId hashname
+
+instance Monoid PathTemplate where
+    mempty = toPathTemplate ""
+    mappend = toPathTemplate .: ((</>) `on` fromPathTemplate)
+    mconcat = toPathTemplate . foldr (</>) "" . map fromPathTemplate
+
+processStuffInDir op t f pid lbi path a = do
+    let tpls = installDirTemplates lbi
+        p = (fromPathTemplate $ f $ substituteInstallDirTemplates env tpls) </> a
+    let path' = (fromPathTemplate $ f $ substituteInstallDirTemplates env
+                 $ tpls {prefix = toPathTemplate path}) </> a
+    print p
+    print path'
+    let toTest = if t then p else path'
+    e <- (||) <$> doesDirectoryExist toTest <*> doesFileExist toTest
+    when e $ do
+        putStrLn $ "path exists: " ++ toTest
+        op p path'
+  where env = initialPathTemplateEnv
+              pid
+              (compilerId (compiler lbi))
+              (hostPlatform lbi)
 
 
 {- |
  Create symlinks to the package \"grabbed\" by hellno in ~/.ghc and the cabal
  installation directory.
 -}
-pushPackage :: InstalledPackageId -> IO ()
-pushPackage ipid = do
+pushPackage :: LocalBuildInfo -> InstalledPackageId -> IO ()
+pushPackage lbi ipid = do
     let (pid, hashname) = parseInstalledPackageId ipid
     let (name, fullname) = packageIdToString pid
     let path = pkgRoot </> name </> fullname </> hashname
-    let makeLink name = linkIfExists (path </> name </> fullname)
-            (instPrefix </> name </> fullname)
-    makeLink "lib"
-    makeLink "share"
-    makeLink $ "share" </> "doc"
+    let makeLink f = processStuffInDir (flip createSymbolicLink) False f pid lbi
+                     path ""
+    putStrLn $ "pushing package" ++ fullname
+    makeLink $ liftA2 (<>) libdir libsubdir
+    makeLink $ liftA2 (<>) datadir datasubdir
+    makeLink docdir
     linkIfExists (path <.> "conf") $ ghcPkg </> hashname <.> "conf"
-    bin <- doesDirectoryExist $ path </> "bin"
-    when bin $ getDirectoryContents' (path </> "bin") >>=
-        mapM_ (\a -> createSymbolicLink (path </> "bin" </> a)
-            (instPrefix </> "bin" </> a))
-    where linkIfExists dest path = do
+    let linkChildren path dest = do
+            children <- getDirectoryContents' dest
+            forM_ children (liftA2 createSymbolicLink ($dest) ($path)
+                                . (</>))
+    processStuffInDir linkChildren False bindir pid lbi path ""
+  where linkIfExists dest path = do
             e <- (||) <$> doesDirectoryExist dest <*> doesFileExist dest
             when e $ createSymbolicLink dest path
 
@@ -129,31 +156,36 @@ pushPackage ipid = do
 {- |
  Remove the package's symlinks hereby effectively removing it from GHC database.
 -}
-pullPackage :: PackageIdentifier -> IO ()
-pullPackage pid = do
+pullPackage :: LocalBuildInfo -> PackageIdentifier -> IO ()
+pullPackage lbi pid = do
     let (name, fullname) = packageIdToString pid
-    let removeLink a = do
-            let path = instPrefix </> a </> fullname
-            e <- (||) <$> doesDirectoryExist path <*> doesFileExist path
-            when e $ removeFile $ instPrefix </> a </> fullname
-    removeLink "lib"
-    removeLink "share"
-    removeLink $ "share" </> "doc"
+    putStrLn $ "pulling package " ++ fullname
     hashname <- getHashName pid
-    let binpath = pkgRoot </> name </> fullname </> hashname </> "bin"
-    bin <- doesDirectoryExist binpath
-    when bin $ getDirectoryContents' binpath >>=
-        mapM_ (\a -> removeFile $ instPrefix </> "bin" </> a)
-    removeFile $ ghcPkg </> (hashname ++ ".conf")
-
+    let path = pkgRoot </> name </> fullname </> hashname
+    let removeLink f = processStuffInDir (const . removeFile) True f pid lbi ""
+                       $ ""
+    removeLink $ liftA2 (<>) libdir libsubdir
+    removeLink $ liftA2 (<>) datadir datasubdir
+    removeLink docdir
+    removeFile $ ghcPkg </> hashname <.> "conf"
+    let removeChildren dest path = do
+            children <- getDirectoryContents' path
+            forM_ children $ removeFile . (dest</>)
+    processStuffInDir removeChildren False bindir pid lbi path ""
 
 -- | Removes the package from hellno's database.
-dropPackage :: InstalledPackageId -> IO ()
-dropPackage ipid = do
+dropPackage :: LocalBuildInfo -> InstalledPackageId -> IO ()
+dropPackage lbi ipid = do
     let (pid, hashname) = parseInstalledPackageId ipid
         (name, fullname) = packageIdToString pid
-    deleteRecursive $ pkgRoot </> name </> fullname </> hashname
-    removeFile $ pkgRoot </> name </> fullname </> (hashname ++ ".conf")
+        path = pkgRoot </> name </> fullname </> hashname
+        deleteStuff f = processStuffInDir (deleteRecursive .: flip const) False
+                        f pid lbi path ""
+    deleteStuff $ liftA2 (<>) libdir libsubdir
+    deleteStuff $ liftA2 (<>) datadir datasubdir
+    deleteStuff docdir
+    deleteStuff bindir
+    removeFile $ pkgRoot </> name </> fullname </> hashname <.> "conf"
     deleteIfEmpty $ pkgRoot </> name </> fullname
     deleteIfEmpty $ pkgRoot </> name
     where deleteIfEmpty dir = do
@@ -162,9 +194,9 @@ dropPackage ipid = do
 
 
 -- | \"Pull\" all packages managed by hellno.
-clearPackages :: IO ()
-clearPackages = getDirectoryContents' ghcPkg >>= filterM islnk >>=
-    mapM_ (pullPackage . fst . parseInstalledPackageId . InstalledPackageId)
+clearPackages :: LocalBuildInfo -> IO ()
+clearPackages lbi = getDirectoryContents' ghcPkg >>= filterM islnk >>=
+    mapM_ (pullPackage lbi . fst . parseInstalledPackageId . InstalledPackageId)
     where islnk f = fmap isSymbolicLink $ getSymbolicLinkStatus $ ghcPkg </> f
 
 
@@ -210,7 +242,9 @@ copyRecursive path dest = do
                 mapM_ (\p -> copyRecursive (path</>p) (dest</>p))
         (False, True) -> readSymbolicLink path >>=
             (flip createSymbolicLink) dest
-        otherwise -> copyFile path dest
+        otherwise -> do
+            createDirectoryIfMissing True $ takeDirectory dest
+            copyFile path dest
 
 
 deleteRecursive :: FilePath -> IO ()

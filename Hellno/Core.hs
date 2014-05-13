@@ -16,6 +16,7 @@ import Data.Set (Set)
 import qualified Data.Set as S
 import Data.List (intercalate)
 import Data.Maybe (catMaybes)
+import Data.Functor
 import Control.Monad.Trans.State.Strict
 import Control.Monad.IO.Class
 import Control.Monad
@@ -23,6 +24,7 @@ import qualified Control.Exception as E
 import System.FilePath
 import System.Directory
 import System.IO.Error
+import Distribution.Simple.LocalBuildInfo
 
 import Hellno
 import Hellno.Packages
@@ -51,9 +53,10 @@ data PackageResolution
  If the first argument is True, only push required precompiled packages and
  don't install anything.
 -}
-setupEnvironment :: Bool -> [String] -> IO ()
+setupEnvironment :: Bool -> [String] -> IO LocalBuildInfo
 setupEnvironment pretend args = do
-    clearPackages
+    lbi <- cabalConfigure [] -- args
+    clearPackages lbi
     recacheUserDb
     fixed <- ghcPkgList
     req <- cabalDryRun True args
@@ -66,25 +69,27 @@ setupEnvironment pretend args = do
                         M.elems m
     putStrLn $ "Using " ++ (show $ length precomp) ++
         " precompiled packages, installing " ++ (show $ length cabalinst)
-    mapM_ pushPackage precomp
+    mapM_ (pushPackage lbi) precomp
     recacheUserDb
     unless pretend $ do
-        cabalInstall args
-        grabAndPush cabalinst
+        cabalInstall $ ["--only-dependencies", "--avoid-reinstalls"] ++ args
+        grabAndPush lbi cabalinst
         recacheUserDb
 
+    return lbi
+
 -- | Grab the packages and then push them.
-grabAndPush :: [PackageId] -> IO ()
-grabAndPush [] = return ()
-grabAndPush pkgs = do
+grabAndPush :: LocalBuildInfo -> [PackageId] -> IO ()
+grabAndPush _ [] = return ()
+grabAndPush lbi pkgs = do
     cabal <- fmap ((</> "packages")) $ getAppUserDataDirectory "cabal"
     caches <- mapM (readCache . (\a -> cabal </> a </> "00-index.cache")) =<<
         getDirectoryContents' cabal
-    mapM_ pushPackage . catMaybes =<< mapM (uncurry grabPackage') .
+    mapM_ (pushPackage lbi) . catMaybes =<< mapM (uncurry grabPackage') .
         zip pkgs . map getCondExecutables . filter hasCondLibrary =<<
         getPackageDescriptions caches pkgs
     where grabPackage' pid execs = do
-            res <- E.try $ grabPackage pid execs
+            res <- E.try $ grabPackage lbi pid execs
             case res of
                 (Right a) -> return $ Just a
                 (Left (e :: E.IOException)) -> do
@@ -109,7 +114,8 @@ cleanDatabase args' = do
                      show n ++ " packages currently in the database."]
                 (["all"]) -> []
                 a -> a
-    clearPackages
+    lbi <- cabalConfigure []
+    clearPackages lbi
     recacheUserDb
     fixed <- ghcPkgList
     saved <- foldM (\s p -> do
@@ -117,32 +123,24 @@ cleanDatabase args' = do
         fmap (( S.union s . S.fromList . map (\(Precompiled i) -> i) .
             filter isPrecomp . M.elems )) $ resolveEnvironment fixed req)
             S.empty args
-    mapM_ (\p -> unless (p `S.member` saved) $ dropPackage p) =<< listPackages
+    mapM_ (\p -> unless (p `S.member` saved) $ dropPackage lbi p)
+        =<< listPackages
     n' <- fmap length listPackages
     putStrLn $ "Dropped " ++ (show $ n - n') ++ " packages."
 
 
--- TODO: Merge these two.
-cabalSrcInstall :: IO ()
-cabalSrcInstall = do
-    setupEnvironment False []
-    pkgs <- cabalDryRun False []
-    r <- findExecutable "cabal-src-install"
-    when (r == Nothing) $ E.throwIO $ userError $
-        "Couldn't find cabal-src-install (is it in PATH?)"
-    runAndWait "cabal-src-install" ["--user"]
-    runAndWait "cabal" ["info"] -- this updates 00-index.cache
-    mapM lookupPackage pkgs >>= mapM_ dropPackage . concat
-    grabAndPush pkgs
-    recacheUserDb
-
 cabalInstallPackage :: [String] -> IO ()
 cabalInstallPackage args = do
-    setupEnvironment False args
+    lbi <- setupEnvironment False args
+    putStrLn "env setup"
     pkgs <- cabalDryRun False args
-    runAndWait "cabal" $ ["--user", "install"] ++ args
-    grabAndPush pkgs
-    recacheUserDb
+    putStrLn "dry run"
+    res <- cabalInstall args
+    when res $ do
+        putStrLn "installed"
+        grabAndPush lbi pkgs
+        putStrLn "grabbed & pushed"
+        recacheUserDb
 
 
 -- | Take the list of fixed packages and the list of required packages and

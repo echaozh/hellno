@@ -7,6 +7,7 @@ module Main where
 import System.Console.GetOpt
 import System.Environment
 import System.Exit
+import Data.Functor
 
 import Hellno
 import Hellno.Packages
@@ -36,7 +37,6 @@ usageHeader = unlines [
     "setup - bring in all (and only) dependencies required by package(s)",
     "try - the same as setup but don't install anything",
     "install - install the package. For local packages, do use local-install.",
-    "local-install - install using cabal-src-install",
     "depclean - clean the database so that only packages required by at least",
     "one of the arguments remain",
     "reset - reset the environment so that only fixed packages remain\n",
@@ -47,12 +47,11 @@ handleArgs :: [Opt] -> [String] -> [String] -> IO ()
 handleArgs opts mode err
     | not (null err) = mapM_ putStrLn err >> exitFailure
     | Opt "help" `elem` opts = putStrLn (usageInfo usageHeader options)
-    | ("setup":xs) <- mode = setupEnvironment False xs
-    | ("try":xs) <- mode = setupEnvironment True xs
+    | ("setup":xs) <- mode = void $ setupEnvironment False xs
+    | ("try":xs) <- mode = void $ setupEnvironment True xs
     | ("depclean":xs) <- mode = cleanDatabase xs
     | ("install":xs) <- mode = cabalInstallPackage xs
-    | ("local-install":[]) <- mode = cabalSrcInstall
-    | ("reset":[]) <- mode = clearPackages >> recacheUserDb
+    | ("reset":[]) <- mode = cabalConfigure [] >>= clearPackages >> recacheUserDb
     | otherwise = putStrLn "Error: No mode specified or unknown mode." >>
         exitFailure
 

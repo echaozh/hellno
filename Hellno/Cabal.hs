@@ -7,14 +7,51 @@
 module Hellno.Cabal where
 
 import System.Process
+import System.IO.Temp
+import System.FilePath
 import System.Exit
+import System.Directory
 import Text.Parsec
+import Data.List (stripPrefix)
 import Data.Maybe
 import Data.Functor.Identity (Identity)
 import qualified Control.Exception as E
+import Control.Applicative hiding ((<|>), many, optional)
+import Distribution.Simple.LocalBuildInfo
+import Distribution.Simple.Configure
 
 import Hellno
 import Hellno.Packages
+import Paths_hellno
+
+cabalConfigure :: [String] -> IO LocalBuildInfo
+cabalConfigure args = do
+    cwd <- getCurrentDirectory
+    noCabal <- null . filter ((==".cabal") . takeExtension) . filter (/=".cabal")
+               <$> getDirectoryContents cwd
+
+    if noCabal
+        then do
+        withSystemTempDirectory "hellno-dummy" $ \tmp ->
+            E.bracket (setCurrentDirectory tmp) (const $ setCurrentDirectory cwd)
+            $ const $ do
+                dummyCabal <- getDataFileName "dummy.cabal_"
+                copyFile dummyCabal "dummy.cabal"
+                configure
+        else configure
+  where configure = do
+            res <- maybeGetPersistBuildConfig "dist/setup-config"
+            case res of
+                Just lbi -> return lbi
+                _ -> do
+                    res <- runAndWait "cabal" $ "configure" : args
+                    case res of
+                        ExitFailure _ -> fail "failed to configure cabal package"
+                        _ -> do
+                            res <- tryGetPersistBuildConfig "dist"
+                            case res of
+                                Right lbi -> return lbi
+                                Left e -> fail $ "failed to parse saved cabal configuration: " ++ fst e
 
 
 -- | Do a @cabal install --dry-run@ and collect the package info.
@@ -32,7 +69,8 @@ cabalDryRun onlyDeps args = do
 -- | Retrieve the list of currently installed packages as reported by ghc-pkg.
 ghcPkgList :: IO [PackageId]
 ghcPkgList = do
-    res <- fmap (parse pkgs "") $ readProcess "ghc-pkg" ["list"] ""
+    res <- fmap (parse pkgs "") $ readProcess "cabal" ["exec", "ghc-pkg", "list"]
+           $ ""
     case res of
         (Left err) -> error $ "Parsing ghc-pkg output failed: " ++ show err
         (Right a) -> return a
@@ -41,12 +79,8 @@ ghcPkgList = do
 -- | Pass the argruments to @cabal install@. Returns True for /ExitSuccess/.
 cabalInstall :: [String] -> IO Bool
 cabalInstall args = do
-    res <- runAndWait "cabal" $ "install":"--only-dependencies":
-        "--avoid-reinstalls":"--user":args
-    return $ case res of
-        (ExitSuccess) -> True
-        otherwise -> False
-
+    res <- runAndWait "cabal" ("install":"--user":args)
+    return $ res == ExitSuccess
 
 -- | Recache the user package database.
 recacheUserDb :: IO ()

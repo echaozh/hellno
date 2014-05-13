@@ -9,7 +9,8 @@ module Hellno (
     module Distribution.Version,
     instPrefix,
     ghcPkg,
-    pkgRoot
+    pkgRoot,
+    tryTill
     ) where
 
 import Distribution.Package
@@ -65,7 +66,7 @@ pkgRoot = unsafePerformIO $ (</>) <$> getAppUserDataDirectory "cabal" <*>
 -- | The directory where GHC stores its .conf files for the user package db.
 ghcPkg :: FilePath
 ghcPkg = unsafePerformIO $ do
-    r <- readProcess "ghc-pkg" ["list"] ""
+    r <- readProcess "cabal" ["exec", "ghc-pkg", "list"] ""
     case parse p "" r of
         (Left e) -> error $ "Parsing ghc-pkg output failed: " ++ show e
         (Right []) -> error "No paths found in ghc-pkg output"
